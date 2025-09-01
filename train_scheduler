@@ -1,0 +1,233 @@
+#!/opt/clmgr/python-36/bin/python3
+__copyright__ = """
+#  Copyright (c) 2021 Hewlett Packard Enterprise Development LP
+#  All rights reserved.
+#
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program; if not, write to the Free Software
+#  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+#
+"""
+
+import argparse
+import glob
+import logging
+import logging.config
+import os
+import subprocess
+import time
+from datetime import datetime, timedelta
+
+import yaml
+from yaml import SafeDumper
+
+logger = logging.getLogger(__name__)
+SafeDumper.add_representer(
+    type(None),
+    lambda dumper, value: dumper.represent_scalar(u'tag:yaml.org,2002:null', '')
+)
+
+
+class LoggerConfigurer(object):
+    """Methods to help configure logging subsystem."""
+
+    @staticmethod
+    def default_config(logger_config):
+        """Configure a logging subsystem using configuration in file or using default parameters.
+        Args:
+            logger_config (str): AIOPs trainer logger configuration file path.
+        """
+        # Configure logging sub-system.
+        try:
+            logging.config.dictConfig(YamlConfiguration.load(logger_config))
+        except Exception as err:
+            raise err
+
+
+class YamlConfiguration(object):
+
+    @staticmethod
+    def load(file_name):
+        with open(file_name, 'r') as config_stream:
+            return yaml.safe_load(config_stream)
+
+    @staticmethod
+    def store(file_name, config):
+        with open(file_name, 'w') as config_stream:
+            yaml.safe_dump(config, config_stream, default_flow_style=False)
+
+
+class TrainScheduler(object):
+
+    SKIP_YAMLS = ['model_repository.yaml', 'aiops_trainerstatus.yaml', 'model_repository_forecast.yaml',
+                  'model_repository_it.yaml', 'model_repository_fabric.yaml']
+
+    def __init__(self, train_cmd):
+        self.train_cmd = train_cmd
+
+    @staticmethod
+    def get_updated_time(file_list):
+        latest_file = max(file_list, key=os.path.getmtime)
+        modified_time = os.stat(latest_file).st_mtime
+        return modified_time
+
+    def train(self):
+        output = subprocess.Popen(self.train_cmd, shell=True, stdout=subprocess.PIPE)
+        container_id = output.stdout.read().decode('utf-8')[:12]
+        if not container_id:
+            logger.info("No Container ID.")
+            return None
+        logger.info("Training has started. Container ID : {}".format(container_id))
+        time.sleep(2)
+
+        loop = True
+        while loop:
+            cmd = "podman ps --filter id={}".format(container_id)
+            output = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+            container_status = output.stdout.read().decode('utf-8')
+            if container_id in container_status:
+                logger.info("Training still running.")
+                time.sleep(60)
+            else:
+                loop = False
+
+    def complete_model_training(self, model_src_path=None):
+        """
+        This method runs the command to train and waits till training is complete.
+        """
+        lat_files = set()
+        prev_files = glob.glob(model_src_path + "*")
+        ref_time = None
+        if prev_files:
+            mtime = TrainScheduler.get_updated_time(file_list=prev_files)
+            ref_time = mtime
+            for file in prev_files:
+
+                if os.path.basename(file) in TrainScheduler.SKIP_YAMLS:
+                    continue
+
+                if os.path.basename(file).startswith("model_repository") and file.endswith(".yaml"):
+                    today = datetime.now()
+                    yesterday = (today - timedelta(days=1)).strftime("%Y_%m_%d_%H_%M")
+                    os.rename(file, "{}_{}".format(file, yesterday))
+
+        prev_files = glob.glob(model_src_path + "*")
+        self.train()
+
+        files_list = glob.glob(model_src_path + "*")
+        if files_list:
+            diff_files = set(prev_files) ^ set(files_list)
+            if diff_files:
+                for item in diff_files:
+                    file_name = os.path.basename(item)
+                    lat_files.add(file_name)
+
+            mtime = TrainScheduler.get_updated_time(file_list=files_list)
+        else:
+            logger.info("Model file not created properly.")
+            return lat_files
+
+        if ref_time:
+            if ref_time < mtime:
+                logger.info("Completed training.")  # New file created freshly.
+            else:
+                logger.info("Model file not created properly.")
+        else:
+            logger.info("Completed training.")  # New file created freshly.
+        return lat_files
+
+    @staticmethod
+    def update_status(src_path, dest_path, lat_files, run_date):
+        """
+        This method updates aiops status yaml file
+        """
+        status_configs = YamlConfiguration.load(os.path.join(src_path, 'aiops_trainerstatus.yaml'))
+        status_configs['run']['run_date'] = run_date.strftime("%Y-%m-%d")
+        status_configs['run']['models_created'] = list(lat_files)
+        if status_configs['enable']['dur']:
+            dur = int(status_configs['enable']['dur'])
+            if dur:
+                status_configs['run']['next_scheduled_date'] = (run_date + timedelta(dur)).strftime("%Y-%m-%d")
+            prev_files = glob.glob(dest_path + "*")
+            if prev_files:
+                update_date = TrainScheduler.get_updated_time(file_list=prev_files)
+                status_configs['run']['copied_date'] = datetime.fromtimestamp(update_date).strftime("%Y-%m-%d")
+            YamlConfiguration.store(os.path.join(src_path, 'aiops_trainerstatus.yaml'), status_configs)
+
+    @staticmethod
+    def load_yaml(file_path):
+        with open(file_path, "r") as fstream:
+            yaml_data = yaml.safe_load(fstream)
+        return yaml_data
+
+    @staticmethod
+    def get_image_name(aiops_image_dir):
+        """ Gets aiops image name from aiops_image_name file.
+        Args:
+            aiops_image_dir : path to aiops image directory
+        """
+
+        command = ["cat", os.path.join(aiops_image_dir, "aiops_image_name")]
+
+        try:
+            p = subprocess.Popen(command, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 universal_newlines=True)
+            aiops_image_name = p.communicate()[0].rstrip()
+
+        except Exception as e:
+            raise Exception("error executing command: " + " ".join(command) + "\n" + str(e))
+        if aiops_image_name == "":
+            raise RuntimeError("empty output displayed by command: " + " ".join(command))
+        if p.returncode != 0:
+            raise RuntimeError("status " + str(p.returncode) + " returned by command: " + " ".join(command))
+
+        return aiops_image_name
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--trainer', nargs="*", type=str, required=True, help="Trainer type")
+    args = parser.parse_args()
+
+    aiops_image_dir = "/opt/clmgr/aiops/images"  # Path where aiops image name and image itself is stored.
+    src_path = "/opt/clmgr/aiops/artifacts/"  # Path where the trained files will be generated.
+    dest_path = "/opt/clmgr/aiops/models/"  # Path where the trained files will be copied.
+    logconfig_path = "/opt/clmgr/aiops/logging/file_logger_train.yaml"
+
+    LoggerConfigurer.default_config(logger_config=logconfig_path)
+    aiops_image_name = TrainScheduler.get_image_name(aiops_image_dir=aiops_image_dir)
+
+    trainers = ' '.join(args.trainer)
+
+    # Command to train the yaml files.
+    train_cmd = "podman run --rm -d --restart on-failure --memory='20g' --cpus='15' --net=host -v " \
+                "/opt/clmgr/aiops:/opt/clmgr/aiops --name aiops_model_trainer " \
+                "--entrypoint /opt/clmgr/aiops/config/train_config/aiops_model_trainer.sh " \
+                "{} --trainers {}".format(aiops_image_name, trainers)
+
+    train_scheduler = TrainScheduler(train_cmd=train_cmd)
+    run_date = datetime.now()
+    # Perform training and get trained files.
+    lat_files = train_scheduler.complete_model_training(src_path)
+    TrainScheduler.update_status(src_path, dest_path, lat_files, run_date)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (SystemExit, KeyboardInterrupt):
+        logger.exception("SystemExit or KeyboardInterrupt exception has caused application to terminate.")
+        raise
+    except Exception:
+        logger.exception("Critical exception has caused application to terminate.")
+        raise
